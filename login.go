@@ -73,7 +73,12 @@ type loginAccount struct {
 type loginResult struct {
 	step    *LoginStep
 	account *loginAccount
+	waiting bool
 }
+
+// approvalPollWindow bounds one wait for an approval made on another device.
+// The attempt survives the window, so the caller simply asks again.
+const approvalPollWindow = 40 * time.Second
 
 // loginAttempt is one multi-screen native login, held only in memory. The
 // password and codes pass straight from the request to Meta.
@@ -169,8 +174,18 @@ func (manager *LoginManager) Submit(ctx context.Context, token string, input map
 	}
 	submittedStep := attempt.lastStep
 	startedAt := time.Now()
+	awaitingApproval := submittedStep != nil && submittedStep.Type == bridgev2.LoginStepTypeDisplayAndWait
+	if awaitingApproval {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, approvalPollWindow)
+		defer cancel()
+	}
 	step, sessionCookies, err := attempt.client.MessengerLite.DoLoginSteps(ctx, input)
 	clear(input)
+	if err != nil && awaitingApproval && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+		manager.log.Info().Str("event", "login_still_waiting").Int64("connection_id", attempt.connectionID).Send()
+		return &loginResult{step: convertLoginStep(submittedStep), waiting: true}, nil
+	}
 	if err != nil {
 		manager.forget(token)
 		manager.log.Warn().Str("event", "login_failed").Int64("connection_id", attempt.connectionID).

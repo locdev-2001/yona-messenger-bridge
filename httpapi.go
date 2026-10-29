@@ -208,7 +208,7 @@ func (api *HTTPAPI) handleLoginSubmit(writer http.ResponseWriter, request *http.
 		writeOK(writer, map[string]any{"done": true, "account": result.account})
 		return
 	}
-	writeOK(writer, map[string]any{"step": result.step})
+	writeOK(writer, map[string]any{"step": result.step, "waiting": result.waiting})
 }
 
 func (api *HTTPAPI) handleLoginCancel(writer http.ResponseWriter, request *http.Request) {

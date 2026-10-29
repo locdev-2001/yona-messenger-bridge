@@ -76,9 +76,21 @@ type loginResult struct {
 	waiting bool
 }
 
-// approvalPollWindow bounds one wait for an approval made on another device.
-// The attempt survives the window, so the caller simply asks again.
-const approvalPollWindow = 40 * time.Second
+// stepWaitWindow bounds how long one HTTP request waits for a login step. The
+// step keeps running on the attempt's own context, so a later request picks up
+// its outcome; Meta's approval polling depends on that context staying alive.
+const stepWaitWindow = 40 * time.Second
+
+// activationTimeout bounds turning a finished login into a running session.
+const activationTimeout = 30 * time.Second
+
+type stepOutcome struct {
+	step      *bridgev2.LoginStep
+	cookies   *cookies.Cookies
+	err       error
+	submitted *bridgev2.LoginStep
+	startedAt time.Time
+}
 
 // loginAttempt is one multi-screen native login, held only in memory. The
 // password and codes pass straight from the request to Meta.
@@ -89,6 +101,28 @@ type loginAttempt struct {
 	client       *messagix.Client
 	createdAt    time.Time
 	lastStep     *bridgev2.LoginStep
+	ctx          context.Context
+	cancel       context.CancelFunc
+	pending      chan stepOutcome
+}
+
+// run starts the next login step in the background, unless one is already in
+// flight, and returns the channel that will carry its outcome.
+func (attempt *loginAttempt) run(input map[string]string) chan stepOutcome {
+	if attempt.pending != nil {
+		clear(input)
+		return attempt.pending
+	}
+	outcome := make(chan stepOutcome, 1)
+	attempt.pending = outcome
+	submitted := attempt.lastStep
+	go func() {
+		startedAt := time.Now()
+		step, sessionCookies, err := attempt.client.MessengerLite.DoLoginSteps(attempt.ctx, input)
+		clear(input)
+		outcome <- stepOutcome{step: step, cookies: sessionCookies, err: err, submitted: submitted, startedAt: startedAt}
+	}()
+	return outcome
 }
 
 type LoginManager struct {
@@ -134,27 +168,43 @@ func (manager *LoginManager) Start(ctx context.Context, token string, connection
 		manager.log.Warn().Str("event", "login_refused_capacity").Int64("connection_id", connectionID).Send()
 		return nil, errSessionCap
 	}
+	attemptCtx, cancel := context.WithTimeout(context.Background(), loginTTL)
 	attempt := &loginAttempt{
 		connectionID: connectionID,
 		platform:     platform,
 		createdAt:    time.Now(),
+		ctx:          manager.libraryLog.With().Int64("connection_id", connectionID).Logger().WithContext(attemptCtx),
+		cancel:       cancel,
 		client: messagix.NewClient(&cookies.Cookies{Platform: platform},
 			manager.libraryLog.With().Int64("connection_id", connectionID).Logger(), &messagix.Config{}),
 	}
 	manager.mu.Lock()
 	if _, exists := manager.attempts[token]; exists {
 		manager.mu.Unlock()
+		cancel()
 		return nil, newAPIError(http.StatusBadRequest, codeBadRequest, "This login token is already in use.")
 	}
 	manager.attempts[token] = attempt
 	manager.mu.Unlock()
 
 	attempt.mu.Lock()
+	outcomeCh := attempt.run(map[string]string{})
+	attempt.mu.Unlock()
+	var outcome stepOutcome
+	select {
+	case outcome = <-outcomeCh:
+	case <-ctx.Done():
+		manager.forget(token)
+		manager.log.Warn().Str("event", "login_start_timeout").Int64("connection_id", connectionID).Send()
+		return nil, newAPIError(http.StatusGatewayTimeout, codeUnknown, "Messenger did not answer in time.")
+	}
+	attempt.mu.Lock()
 	defer attempt.mu.Unlock()
-	step, sessionCookies, err := attempt.client.MessengerLite.DoLoginSteps(ctx, nil)
+	attempt.pending = nil
+	step, sessionCookies, err := outcome.step, outcome.cookies, outcome.err
 	if err != nil || sessionCookies != nil {
 		manager.forget(token)
-		manager.log.Warn().Str("event", "login_start_failed").Int64("connection_id", connectionID).Str("code", loginErrorCode(err)).Send()
+		manager.log.Warn().Str("event", "login_start_failed").Int64("connection_id", connectionID).Str("code", loginErrorCode(err)).AnErr("error", err).Send()
 		return nil, mapLoginError(err)
 	}
 	attempt.lastStep = step
@@ -167,34 +217,38 @@ func (manager *LoginManager) Submit(ctx context.Context, token string, input map
 	if err != nil {
 		return nil, err
 	}
-	attempt.mu.Lock()
-	defer attempt.mu.Unlock()
 	if input == nil {
 		input = map[string]string{}
 	}
-	submittedStep := attempt.lastStep
-	startedAt := time.Now()
-	awaitingApproval := submittedStep != nil && submittedStep.Type == bridgev2.LoginStepTypeDisplayAndWait
-	if awaitingApproval {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, approvalPollWindow)
-		defer cancel()
+	attempt.mu.Lock()
+	outcomeCh := attempt.run(input)
+	attempt.mu.Unlock()
+
+	wait := time.NewTimer(stepWaitWindow)
+	defer wait.Stop()
+	var outcome stepOutcome
+	select {
+	case outcome = <-outcomeCh:
+	case <-wait.C:
+		return manager.stillWaiting(attempt), nil
+	case <-ctx.Done():
+		return manager.stillWaiting(attempt), nil
 	}
-	step, sessionCookies, err := attempt.client.MessengerLite.DoLoginSteps(ctx, input)
-	clear(input)
-	if err != nil && awaitingApproval && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
-		manager.log.Info().Str("event", "login_still_waiting").Int64("connection_id", attempt.connectionID).Send()
-		return &loginResult{step: convertLoginStep(submittedStep), waiting: true}, nil
-	}
+
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	attempt.pending = nil
+	step, sessionCookies, err := outcome.step, outcome.cookies, outcome.err
 	if err != nil {
 		manager.forget(token)
 		manager.log.Warn().Str("event", "login_failed").Int64("connection_id", attempt.connectionID).
-			Str("code", loginErrorCode(err)).Int64("duration_ms", time.Since(startedAt).Milliseconds()).Send()
+			Str("code", loginErrorCode(err)).AnErr("error", err).
+			Int64("duration_ms", time.Since(outcome.startedAt).Milliseconds()).Send()
 		return nil, mapLoginError(err)
 	}
 	if step != nil {
 		attempt.lastStep = step
-		if rejection := repeatedStepRejection(submittedStep, step); rejection != nil {
+		if rejection := repeatedStepRejection(outcome.submitted, step); rejection != nil {
 			manager.log.Info().Str("event", "login_step_rejected").Int64("connection_id", attempt.connectionID).
 				Str("step_id", shortStepID(step.StepID)).Str("code", rejection.code).Send()
 			return nil, rejection
@@ -202,15 +256,29 @@ func (manager *LoginManager) Submit(ctx context.Context, token string, input map
 		manager.log.Info().Str("event", "login_step").Int64("connection_id", attempt.connectionID).Str("step_id", shortStepID(step.StepID)).Send()
 		return &loginResult{step: convertLoginStep(step)}, nil
 	}
-	manager.forget(token)
 	session := newStoredSession(attempt.connectionID, attempt.platform, sessionCookies, attempt.client.MessengerLite.GetNativeSession())
-	account, err := manager.slots.ActivateLogin(ctx, session)
+	manager.forget(token)
+	activationCtx, cancel := context.WithTimeout(context.Background(), activationTimeout)
+	defer cancel()
+	account, err := manager.slots.ActivateLogin(activationCtx, session)
 	if err != nil {
+		manager.log.Warn().Str("event", "login_activation_failed").Int64("connection_id", attempt.connectionID).AnErr("error", err).Send()
 		return nil, err
 	}
 	manager.log.Info().Str("event", "login_completed").Int64("connection_id", attempt.connectionID).
 		Int64("duration_ms", time.Since(attempt.createdAt).Milliseconds()).Send()
 	return &loginResult{account: account}, nil
+}
+
+func (manager *LoginManager) stillWaiting(attempt *loginAttempt) *loginResult {
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	manager.log.Info().Str("event", "login_still_waiting").Int64("connection_id", attempt.connectionID).Send()
+	var step *LoginStep
+	if attempt.lastStep != nil {
+		step = convertLoginStep(attempt.lastStep)
+	}
+	return &loginResult{step: step, waiting: true}
 }
 
 func (manager *LoginManager) Cancel(token string) {
@@ -219,6 +287,7 @@ func (manager *LoginManager) Cancel(token string) {
 	delete(manager.attempts, token)
 	manager.mu.Unlock()
 	if attempt != nil {
+		attempt.cancel()
 		manager.log.Info().Str("event", "login_cancelled").Int64("connection_id", attempt.connectionID).Send()
 	}
 }
@@ -232,6 +301,7 @@ func (manager *LoginManager) liveAttempt(token string) (*loginAttempt, error) {
 	}
 	if time.Since(attempt.createdAt) > loginTTL {
 		delete(manager.attempts, token)
+		attempt.cancel()
 		return nil, errLoginExpired
 	}
 	return attempt, nil
@@ -239,8 +309,12 @@ func (manager *LoginManager) liveAttempt(token string) (*loginAttempt, error) {
 
 func (manager *LoginManager) forget(token string) {
 	manager.mu.Lock()
+	attempt := manager.attempts[token]
 	delete(manager.attempts, token)
 	manager.mu.Unlock()
+	if attempt != nil {
+		attempt.cancel()
+	}
 }
 
 func (manager *LoginManager) RunJanitor(ctx context.Context) {
@@ -255,6 +329,7 @@ func (manager *LoginManager) RunJanitor(ctx context.Context) {
 			for token, attempt := range manager.attempts {
 				if time.Since(attempt.createdAt) > loginTTL {
 					delete(manager.attempts, token)
+					attempt.cancel()
 				}
 			}
 			manager.mu.Unlock()

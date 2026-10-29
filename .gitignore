@@ -1,0 +1,7 @@
+/state/
+/messenger-bridge
+/bin/
+.env
+.env.production
+*.db
+*.db-*

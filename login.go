@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strings"
@@ -30,6 +31,7 @@ const (
 	fieldTypePhone    = "phone"
 	fieldTypePassword = "password"
 	fieldTypeCode     = "code"
+	fieldTypeCaptcha  = "captcha"
 )
 
 // Login steps that Meta shows again, with an error line, when the submitted
@@ -38,10 +40,19 @@ var credentialStepIDs = map[string]bool{"email_password": true, "password": true
 var codeStepIDs = map[string]bool{"otp_code": true, "totp": true, "sms": true, "backup_code": true, "whatsapp": true}
 
 type LoginStep struct {
-	Type         string       `json:"type"`
-	StepID       string       `json:"step_id"`
-	Instructions *string      `json:"instructions"`
-	Fields       []LoginField `json:"fields"`
+	Type         string            `json:"type"`
+	StepID       string            `json:"step_id"`
+	Instructions *string           `json:"instructions"`
+	Fields       []LoginField      `json:"fields"`
+	Attachments  []LoginAttachment `json:"attachments"`
+}
+
+// LoginAttachment carries what the person must look at or listen to before
+// answering a step, such as the captcha image and its audio version.
+type LoginAttachment struct {
+	Kind     string `json:"kind"`
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data_base64"`
 }
 
 type LoginField struct {
@@ -260,6 +271,7 @@ func convertLoginStep(step *bridgev2.LoginStep) *LoginStep {
 		StepID:       shortStepID(step.StepID),
 		Instructions: optionalString(step.Instructions),
 		Fields:       []LoginField{},
+		Attachments:  []LoginAttachment{},
 	}
 	if step.Type != bridgev2.LoginStepTypeUserInput && step.Type != bridgev2.LoginStepTypeDisplayAndWait {
 		converted.Type = string(bridgev2.LoginStepTypeUserInput)
@@ -279,7 +291,27 @@ func convertLoginStep(step *bridgev2.LoginStep) *LoginStep {
 			Description: optionalString(description),
 		})
 	}
+	for _, attachment := range step.UserInputParams.Attachments {
+		if attachment == nil || len(attachment.Content) == 0 {
+			continue
+		}
+		converted.Attachments = append(converted.Attachments, LoginAttachment{
+			Kind:     attachmentKind(attachment.Info.MimeType),
+			MimeType: attachment.Info.MimeType,
+			Data:     base64.StdEncoding.EncodeToString(attachment.Content),
+		})
+	}
 	return converted
+}
+
+func attachmentKind(mimeType string) string {
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		return "image"
+	case strings.HasPrefix(mimeType, "audio/"):
+		return "audio"
+	}
+	return "file"
 }
 
 func convertFieldType(fieldType bridgev2.LoginInputFieldType) string {
@@ -290,8 +322,10 @@ func convertFieldType(fieldType bridgev2.LoginInputFieldType) string {
 		return fieldTypeEmail
 	case bridgev2.LoginInputFieldTypePhoneNumber:
 		return fieldTypePhone
-	case bridgev2.LoginInputFieldType2FACode, bridgev2.LoginInputFieldTypeCaptchaCode:
+	case bridgev2.LoginInputFieldType2FACode:
 		return fieldTypeCode
+	case bridgev2.LoginInputFieldTypeCaptchaCode:
+		return fieldTypeCaptcha
 	}
 	return fieldTypeText
 }

@@ -32,6 +32,7 @@ const (
 	fieldTypePassword = "password"
 	fieldTypeCode     = "code"
 	fieldTypeCaptcha  = "captcha"
+	fieldTypeSelect   = "select"
 )
 
 // Login steps that Meta shows again, with an error line, when the submitted
@@ -56,10 +57,11 @@ type LoginAttachment struct {
 }
 
 type LoginField struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Type        string  `json:"type"`
-	Description *string `json:"description"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Description *string  `json:"description"`
+	Options     []string `json:"options"`
 }
 
 type loginAccount struct {
@@ -280,15 +282,16 @@ func convertLoginStep(step *bridgev2.LoginStep) *LoginStep {
 		return converted
 	}
 	for _, field := range step.UserInputParams.Fields {
-		description := field.Description
-		if len(field.Options) > 0 {
-			description = strings.TrimSpace(description + " Options: " + strings.Join(field.Options, ", "))
+		options := field.Options
+		if options == nil {
+			options = []string{}
 		}
 		converted.Fields = append(converted.Fields, LoginField{
 			ID:          field.ID,
 			Name:        field.Name,
 			Type:        convertFieldType(field.Type),
-			Description: optionalString(description),
+			Description: optionalString(field.Description),
+			Options:     options,
 		})
 	}
 	for _, attachment := range step.UserInputParams.Attachments {
@@ -326,6 +329,8 @@ func convertFieldType(fieldType bridgev2.LoginInputFieldType) string {
 		return fieldTypeCode
 	case bridgev2.LoginInputFieldTypeCaptchaCode:
 		return fieldTypeCaptcha
+	case bridgev2.LoginInputFieldTypeSelect:
+		return fieldTypeSelect
 	}
 	return fieldTypeText
 }
